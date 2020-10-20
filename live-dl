@@ -63,9 +63,14 @@
 USER_AGENT="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.120 Safari/537.36"
 IMAGE_PROXY_BASE="https://experiments.sparanoid.net/imageproxy/"
 
-#
+# 
 # Functions
 #
+
+# https://stackoverflow.com/questions/10053678/
+json_escape () {
+    printf '%s' "$1" | python -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+}
 
 # Text color helper borrowed from acme.sh
 __green() {
@@ -81,13 +86,13 @@ __red() {
 }
 
 __info() {
-  printf "[$(date)] %s\n" "$1"
+	printf "[$UPLOADER] %s\n" "$1"
 }
 
 __debug() {
   DEBUG="${PARAM_DEBUG:-"false"}"
-  if [ "$DEBUG" == "true" ]; then
-    printf "[$(date)] DEBUG: %s\n" "$1"
+  if [ "$DEBUG" == "true" ] && [ -z "$DEBUG_MUTE" ]; then
+    printf "DEBUG: %s\n" "$1"
   fi
 }
 
@@ -119,6 +124,11 @@ while [ $# -gt 0 ]; do
       ;;
     -o|--output)
       PARAM_BASE_DIR="$2"
+      shift
+      shift
+      ;;
+		-of|--output-final)
+      PARAM_FINAL_DIR="$2"
       shift
       shift
       ;;
@@ -425,8 +435,18 @@ function func_check_state() {
   # Cons:
   # - Can get wrong live state due to page caching, network interrupts, etc.
   local _body=$(curl -s --compressed -H "User-Agent: $USER_AGENT" "$_url")
-
-  METADATA_CURL=`echo "$_body" | grep '"ytInitialPlayerResponse"' | perl -pe 's/^.*?({".*}).*/\1/g' | jq -r .`
+	
+	PLAYER_RESPONSE=`echo "$_body" | grep '"ytInitialPlayerResponse"'`
+	
+	# Fix for perl regex if returning null, probably a way better way to do it
+	__debug "curl ytInitialPlayerResponse length: ${#PLAYER_RESPONSE}"
+	if [ ${#PLAYER_RESPONSE} -lt 100 ]; then
+	__debug "CURL_METADATA IS NULL"
+	METADATA_CURL=""
+	else
+	__debug "CURL_METADATA IS NOT NULL"
+  METADATA_CURL=`echo "$PLAYER_RESPONSE" | perl -pe 's/^.*?(\{".*}).*/\1/g' | jq -r .`
+	fi
 
   # Check if returns nothing
   if [ ! -z "$METADATA_CURL" ]; then
@@ -467,8 +487,11 @@ function func_check_state() {
     VIDEO_ID=$(echo "$METADATA_CURL" | jq -r '.videoDetails.videoId')
     FULLTITLE=$(echo "$METADATA_CURL" | jq -r '.videoDetails.title')
     DESCRIPTION=$(echo "$METADATA_CURL" | jq -r '.videoDetails.shortDescription')
-    UPLOADER=$(echo "$METADATA_CURL" | jq -r '.videoDetails.author')
     CHANNEL_ID=$(echo "$METADATA_CURL" | jq -r '.videoDetails.channelId')
+    UPLOADER=$(echo "$METADATA_CURL" | jq -r '.videoDetails.author')
+		DEBUG_MUTE="true"
+		func_process_channel_mapping
+		unset DEBUG_MUTE
 
     # If I got `isLive: true` in first check, let me assume it's live but I can't trust it so I
     # will do a secound check using youtube-dl later with this flag.
@@ -505,7 +528,8 @@ function func_check_state() {
     # Print current state for first check
     __debug "Current state for first check: $(__yellow "$CONTENT_STATE")"
   else
-    __info "$(__yellow "Not a valid page, something wrong with your internet connection?")"
+    #__info "$(__yellow "Not a valid page, something wrong with your internet connection?")"
+    __info "$(__yellow "Page is not valid or the latest stream was privated.")"
   fi
 
   # Old method:
@@ -573,11 +597,16 @@ function func_check_state() {
     if ([ "$CONTENT_STATE" != "offline" ] && [ "$_mode" != "lazy" ]) || \
       ([ "$CONTENT_STATE" == "offline" ] && [ "$_mode" == "lazy" ])
     then
+			# Set timestamp for filenames. Should not change after downloading begins.
+			if [ "$_mode" != "lazy" ]; then
+				DATETIME=`date -u +'%F %T'`
+			fi
+			
       __info "Re-checking via youtube-dl..."
       METADATA=`youtube-dl --ignore-config --no-playlist --playlist-items 0 \
         --skip-download --print-json --force-ipv4 --referer 'https://www.youtube.com/feed/subscriptions' \
-        -o '%(upload_date)s %(title)s (%(id)s).%(ext)s' \
-        "$_url" 2>&1`
+        -o "$DATETIME (%(id)s) %(title)s.%(ext)s" \
+        "$VIDEO_ID"`
 
       # Check if returns nothing
       if [ ! -z "$METADATA" ]; then
@@ -654,7 +683,7 @@ function func_send_email() {
           -F from="Livestream Downloader (live-dl) <live-dl@$CONFIG_MAILGUN_DOMAIN>" \
           -F to="$CONFIG_MAILGUN_RECEIPT" \
           -F subject="$_title" \
-          -F text="$_content" >> "$OUTPUT_PATH.log" 2>&1
+          -F text="$_content" >> "$OUTPUT_BASE/$UPLOADER.log" 2>&1
       fi
     fi
 
@@ -1087,6 +1116,7 @@ function func_download_youtube() {
   __info "Logging: tail -f \"$OUTPUT_PATH.log\""
 
   if [ "$CONTENT_STATE" == "live" ]; then
+		renice -n 0 $$ # Nice to 0 for stream DL
     streamlink \
       --force \
       --http-timeout 180 \
@@ -1097,11 +1127,12 @@ function func_download_youtube() {
       --hls-segment-ignore-names preloading \
       --hls-playlist-reload-attempts 30 \
       --hls-live-edge 5 \
-      --hls-timeout 90 \
+      --hls-timeout 180 \
       --ringbuffer-size 256M \
       --loglevel trace \
       -o "$OUTPUT_PATH.ts" \
-      "${WEBPAGE_URL}" best >> "$OUTPUT_PATH.log" 2>&1
+      "${WEBPAGE_URL}" best > "$OUTPUT_BASE/$UPLOADER.log" 2>&1
+		renice -n 1 $$ # Back to 1
   elif [ "$CONTENT_STATE" == "video" ]; then
     if [ "$DL_TYPE" == "playlist" ]; then
       # TODO: You have to loop over all the videos to add metadata and thumbnail manually.
@@ -1116,14 +1147,13 @@ function func_download_youtube() {
         --external-downloader aria2c \
         --external-downloader-args '-j 16 -s 16 -x 16 -k 1M --retry-wait 10 --max-tries 10' \
         -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' \
-        --write-auto-sub \
         --write-sub \
         --sub-lang en,zh-Hans,zh-Hant,ja \
         --sub-format best \
         --embed-subs \
         --force-ipv4 \
         --retries 30 \
-        -o "${OUTPUT_BASE}/%(upload_date)s %(title)s (%(id)s).%(ext)s" \
+        -o "${OUTPUT_BASE}/$DATETIME (%(id)s) %(title)s.%(ext)s" \
         "${WEBPAGE_URL}"
     else
       youtube-dl \
@@ -1131,13 +1161,12 @@ function func_download_youtube() {
         --external-downloader aria2c \
         --external-downloader-args '-j 16 -s 16 -x 16 -k 1M --retry-wait 10 --max-tries 10' \
         -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' \
-        --write-auto-sub \
         --write-sub \
         --sub-lang en,zh-Hans,zh-Hant,ja \
         --sub-format best \
         --force-ipv4 \
         --retries 30 \
-        -o "${OUTPUT_BASE}/%(upload_date)s %(title)s (%(id)s).%(ext)s" \
+        -o "${OUTPUT_BASE}/$DATETIME (%(id)s) %(title)s.%(ext)s" \
         "${WEBPAGE_URL}"
     fi
   else
@@ -1157,13 +1186,13 @@ function func_finalize_download() {
     __info "Converting to MP4"
     ffmpeg -i "$OUTPUT_PATH.ts" -y \
       -codec copy \
-      "$OUTPUT_PATH.mp4" >> "$OUTPUT_PATH.log" 2>&1
+      "$OUTPUT_PATH.mp4" >> "$OUTPUT_BASE/$UPLOADER.log" 2>&1
 
     # Remove original TS file
     rm -f "$OUTPUT_PATH.ts"
   fi
 
-  if [ ! "$SKIP_METADATA" ]; then
+  if [ "$SKIP_METADATA" != "true" ]; then
     __info "Trying to write metadata and artwork"
 
     # Write metadata to MP4 (will override existing with -y option)
@@ -1176,7 +1205,7 @@ function func_finalize_download() {
         -metadata date="$UPLOAD_DATE" \
         -metadata description="$DESCRIPTION" \
         -metadata comment="$DESCRIPTION" \
-        "$OUTPUT_PATH-metadata.mp4" >> "$OUTPUT_PATH.log" 2>&1
+        "$OUTPUT_PATH-metadata.mp4" >> "$OUTPUT_BASE/$UPLOADER.log" 2>&1
       rm -f "$OUTPUT_PATH.mp4" && mv "$OUTPUT_PATH-metadata.mp4" "$OUTPUT_PATH.mp4"
     else
       __info "$(__yellow "Output file not exists, skip writing metadata.")"
@@ -1195,7 +1224,7 @@ function func_finalize_download() {
           -map 1 -map 0 \
           -codec copy \
           -disposition:0 attached_pic \
-          "$OUTPUT_PATH-artwork.mp4" >> "$OUTPUT_PATH.log" 2>&1
+          "$OUTPUT_PATH-artwork.mp4" >> "$OUTPUT_BASE/$UPLOADER.log" 2>&1
         rm -f "$OUTPUT_PATH.mp4" && mv "$OUTPUT_PATH-artwork.mp4" "$OUTPUT_PATH.mp4"
       else
         __info "$(__yellow "Artwork missing, this is a rare case, please report at my GitHub.")"
@@ -1222,8 +1251,39 @@ function func_finalize_download() {
     FILE_SUMMARY_SIZE_CALC=$(numfmt --to=iec-i --suffix=B $FILE_SUMMARY_SIZE)
     FILE_SUMMARY="Duration:  $FILE_SUMMARY_DURATION_CALC
 Size:      $FILE_SUMMARY_SIZE_CALC
-Path:      $HOSTNAME:$OUTPUT_PATH.mp4
 " && echo -e "\n$FILE_SUMMARY"
+		
+		# Clean up non video files
+		__info "Deleting non-video files"
+		find "$OUTPUT_BASE" -type f -name "$FILENAME.jpg" -delete
+		find "$OUTPUT_BASE" -type f -name "$FILENAME.json" -delete
+		
+		SUPER_FINAL_PATH="$OUTPUT_PATH.mp4"
+		
+		# If final output is specified, copy video there
+		if [ -n "$FINAL_DIR" ]; then
+			# Final base without filename
+			FINAL_BASE="$FINAL_DIR/$FILENAME_BASE"
+
+			# Full output dir
+			FINAL_PATH="$FINAL_BASE/$FILENAME"
+			
+			func_prepare_dir "$FINAL_BASE"
+			
+			__info "Moving video to $FINAL_BASE"
+			mv -f "$OUTPUT_PATH.mp4" "$FINAL_PATH.mp4"
+			
+			SUPER_FINAL_PATH="$FINAL_PATH.mp4"
+		fi
+		
+		if [ -f ./cleanup ]; then
+			# Bunch of hardcoded stuff here =/
+			CLEANUP_COUNT=48
+			CLEANUP_PATH=`realpath ./cleanup`
+			__info "Cleanup for $VIDEO_ID: $CLEANUP_COUNT once every hour"
+			echo "$CLEANUP_PATH \"$VIDEO_ID\" \"$SUPER_FINAL_PATH\" $CLEANUP_COUNT" | at now + 1 hour -q h
+		fi
+		
   else
     FILE_SUMMARY="File summary not available due to missing files"
     __info "$(__yellow "File summary not available due to missing files.")"
@@ -1236,12 +1296,15 @@ Path:      $HOSTNAME:$OUTPUT_PATH.mp4
   # --hls-timeout to make sure the streamer correctly stops the stream, but the longer the
   # --hls-timeout you set, the longer the notification you will get after the streamer actually
   # stops his/her stream.
-  sleep 10
+  # sleep 10
 }
 
 #
 # Executes
 #
+
+# Set niceness a bit lower, it is set to 0 when downloading a stream
+renice -n 1 $$
 
 # Init scripts with `--init` specified
 INIT_SCRIPT="${PARAM_INIT_SCRIPT:-"false"}"
@@ -1297,12 +1360,14 @@ fi
 # Remove trailing slash for user defined directory
 # https://stackoverflow.com/a/1848456/412385
 _PARAM_BASE_DIR=${PARAM_BASE_DIR%/*}
+_PARAM_FINAL_DIR=${PARAM_FINAL_DIR%/*}
 
 # Expand $HOME so that later I can replace `~` with escaped $HOME path in `config.yml`
 HOME_EXPANDED=$(echo "$HOME" | sed -e 's/\//\\\//g')
 
 CONFIG_MODE=`echo $CONFIG_RAW | jq -r '.config.mode | select(.!=null)'`
 CONFIG_BASE_DIR=`echo $CONFIG_RAW | jq -r .config.output | sed -e 's/~/'"$HOME_EXPANDED"'/g'`
+CONFIG_FINAL_DIR=`echo $CONFIG_RAW | jq -r .config.output_final | sed -e 's/~/'"$HOME_EXPANDED"'/g'`
 CONFIG_INTERVAL=`echo $CONFIG_RAW | jq -r '.config.interval | select(.!=null)'`
 CONFIG_SKIP_ALIAS=`echo $CONFIG_RAW | jq -r '.config.skip_alias | select(.!=null)'`
 CONFIG_SKIP_CONVERT=`echo $CONFIG_RAW | jq -r '.config.skip_convert | select(.!=null)'`
@@ -1325,6 +1390,7 @@ CONFIG_TELEGRAM_CHANNEL=`echo $CONFIG_RAW | jq -r '.config.telegram.channel | se
 
 MODE="${PARAM_MODE:-$CONFIG_MODE}"
 BASE_DIR="${_PARAM_BASE_DIR:-$CONFIG_BASE_DIR}"
+FINAL_DIR="${_PARAM_FINAL_DIR:-$CONFIG_FINAL_DIR}"
 INTERVAL="${PARAM_INTERVAL:-$CONFIG_INTERVAL}"
 SKIP_ALIAS="${PARAM_SKIP_ALIAS:-$CONFIG_SKIP_ALIAS}"
 SKIP_CONVERT="${PARAM_SKIP_CONVERT:-$CONFIG_SKIP_CONVERT}"
@@ -1339,6 +1405,7 @@ URL_INPUT="$1"
 __info "URL (URI) to process           : ${URL_INPUT}"
 __info "Mode                           : ${MODE}"
 __info "Output base dir                : ${BASE_DIR}"
+__info "Final output dir               : ${FINAL_DIR}"
 __info "Run interval (when loop)       : ${INTERVAL}"
 __info "Skip script alias              : ${SKIP_ALIAS}"
 __info "Skip convert                   : ${SKIP_CONVERT}"
