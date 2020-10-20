@@ -2,7 +2,7 @@
 This is just the original live-dl with some real hacky tweaks to make it work in the way I wanted it to.
 It's got plenty of undocumented and possibly untested changes, so I really don't suggest using it yourself.
 
-If you do end up trying to make this work, then know that you'll need to install the `at` scheduler as well. It's used for the cleanup script.
+If you do end up trying to make this work, then know that you'll need to install the `at` scheduler as well. It's used for the cleanup script. You might also want to run it as a systemd service. I have included my `holoarchive@.service` file for this.
 
 If you want something made by someone who actually knows what they're doing, then have a look at these:  
 https://github.com/lekoOwO/vtbackup  
