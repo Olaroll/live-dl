@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# I dunno if outputs even shows up anywhere
+__info() {
+	printf "[$(date)] %s\n" "$1"
+}
+
+# Get path to self
+SCRIPTPATH=`realpath "$0"`
+
+# Assign parameters to variables
+ID="$1"
+FILE="$2"
+COUNT=${3:-0}
+HOURS=${4:-1}
+
+#Get youtube metadata to check if the video is up. Probably a better way to do this, I just copied this from live-dl
+METADATA=`youtube-dl --ignore-config --no-playlist --playlist-items 0 \
+	--skip-download --print-json --force-ipv4 --referer 'https://www.youtube.com/feed/subscriptions' \
+	"https://www.youtube.com/watch?v=$ID"`
+
+# Decide on what to do
+if [ -z "$METADATA" ]; then
+	# Metadata not found, meaning the original is gone
+	__info "Original not found, no further action"
+	echo "$ID = $FILE" >> /home/olari/holoarchive/cleanup_kept.log # Log of kept videos
+elif [ "$COUNT" -gt "0" ]; then
+	# Metadata found, but there are still checks left
+	__info "Scheduling next check (Count: $COUNT )"
+	echo "$SCRIPTPATH \"$ID\" \"$FILE\" $((COUNT-1)) $HOURS" | at now + "$HOURS" hours -q h
+else
+	# Metadata found and all checks exhausted
+	__info "Deleting $FILE"
+	echo "$ID = $FILE" >> /home/olari/holoarchive/cleanup_deleted.log # Log of deleted videos
+	rm -f "$FILE"
+fi
+exit
